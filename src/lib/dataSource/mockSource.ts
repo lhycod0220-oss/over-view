@@ -1,7 +1,17 @@
+/**
+ * 백엔드 없이 화면 전체를 돌려보기 위한 목업 소스.
+ *
+ * 타입은 백엔드 실제 스펙(types.ts)을 따르지만, **mock 은 백엔드가 제공하지 않는 필드까지
+ * 일부러 채웁니다.** 기압·RSSI·배터리·가동시간 카드가 mock 에서는 값이 보이고
+ * http 모드에서는 "데이터 없음(백엔드 미지원)" 으로 바뀌는 것이 의도된 동작입니다.
+ */
+
 import type {
   ConnectionState,
-  ControlCommand,
-  NodeConfig,
+  ControlDownlink,
+  ControlResult,
+  FirmwareVariant,
+  GatewayConfig,
   NodeInfo,
   PowerSample,
   ProtocolStats,
@@ -10,25 +20,31 @@ import type {
   TelemetrySample,
   TelemetrySource,
 } from "./types";
+import {
+  CLIENT_ID_GINGERBREAD,
+  CLIENT_ID_MONITOR,
+  CLIENT_ID_STANDARD_MQTT,
+} from "./mappers";
 
+/** 실제 백엔드와 같은 client_id 를 쓰므로 mock ↔ http 전환 시 노드 식별이 이어집니다. */
 const NODES: NodeInfo[] = [
   {
-    nodeId: "node-01",
+    nodeId: CLIENT_ID_STANDARD_MQTT,
     name: "Standard MQTT",
     firmware: "standard_mqtt",
-    role: "primary",
+    role: "baseline",
     ingestPath: "mqtt",
   },
   {
-    nodeId: "node-02",
-    name: "Baseline (Gingerbread)",
+    nodeId: CLIENT_ID_GINGERBREAD,
+    name: "Gingerbread",
     firmware: "gingerbread",
-    role: "baseline",
-    ingestPath: "collector",
+    role: "primary",
+    ingestPath: "udp",
   },
   {
-    nodeId: "node-03",
-    name: "Monitor",
+    nodeId: CLIENT_ID_MONITOR,
+    name: "Power Monitor",
     firmware: "monitor",
     role: "primary",
     ingestPath: "udp",
@@ -48,55 +64,6 @@ function seededRandom(seed: number) {
   };
 }
 
-class NodeSimState {
-  msgId = 0;
-  temperatureC: number;
-  humidityPct: number;
-  pressureHpa = 1013 + Math.random() * 6 - 3;
-  gasResistanceOhm: number;
-  batteryV = 4.05 + Math.random() * 0.1;
-  uptimeS = Math.floor(Math.random() * 50_000);
-  rand: () => number;
-
-  constructor(seed: number, baseTemp: number, baseGasOhm: number) {
-    this.rand = seededRandom(seed);
-    this.temperatureC = baseTemp;
-    this.humidityPct = 45 + this.rand() * 10;
-    this.gasResistanceOhm = baseGasOhm;
-  }
-
-  tick(): TelemetrySample {
-    this.msgId += 1;
-    this.temperatureC += (this.rand() - 0.5) * 0.3;
-    this.humidityPct = clamp(this.humidityPct + (this.rand() - 0.5) * 1.2, 30, 80);
-    this.pressureHpa += (this.rand() - 0.5) * 0.4;
-    // 가스 저항은 VOC 농도가 오를수록 떨어지는 경향을 단순 시뮬레이션
-    this.gasResistanceOhm = clamp(
-      this.gasResistanceOhm + (this.rand() - 0.52) * 4000,
-      20_000,
-      180_000
-    );
-    this.batteryV = clamp(this.batteryV - 0.00004 + (this.rand() - 0.5) * 0.0005, 3.3, 4.2);
-    this.uptimeS += 2;
-
-    const gasResistanceOhm = Math.round(this.gasResistanceOhm);
-    const sample: TelemetrySample = {
-      msgId: this.msgId,
-      nodeId: "",
-      timestamp: isoNow(),
-      temperatureC: round(this.temperatureC, 2),
-      humidityPct: round(this.humidityPct, 1),
-      pressureHpa: round(this.pressureHpa, 1),
-      gasResistanceOhm,
-      rssiDbm: Math.round(-58 - this.rand() * 22),
-      batteryV: round(this.batteryV, 3),
-      uptimeS: this.uptimeS,
-      gasValid: computeGasValid(gasResistanceOhm, this.rand),
-    };
-    return sample;
-  }
-}
-
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v));
 }
@@ -105,15 +72,65 @@ function round(v: number, digits: number) {
   return Math.round(v * f) / f;
 }
 
-const FIRMWARE_BY_NODE: Record<string, "standard_mqtt" | "monitor" | "gingerbread"> = {
-  "node-01": "standard_mqtt",
-  "node-02": "gingerbread",
-  "node-03": "monitor",
+const FIRMWARE_BY_NODE: Record<string, FirmwareVariant> = {
+  [CLIENT_ID_STANDARD_MQTT]: "standard_mqtt",
+  [CLIENT_ID_GINGERBREAD]: "gingerbread",
+  [CLIENT_ID_MONITOR]: "monitor",
 };
 
+/** BME680 가스 저항 정상 범위(kΩ). 백엔드 _GAS_MIN_OHM/_GAS_MAX_OHM 과 같은 단위입니다. */
+const GAS_MIN_KOHM = 25;
+const GAS_MAX_KOHM = 175;
+
+class NodeSimState {
+  msgId = 0;
+  temperatureC: number;
+  humidityPct: number;
+  pressureHpa = 1013 + Math.random() * 6 - 3;
+  gasResistanceKohm: number;
+  batteryV = 4.05 + Math.random() * 0.1;
+  uptimeS = Math.floor(Math.random() * 50_000);
+  rand: () => number;
+
+  constructor(seed: number, baseTemp: number, baseGasKohm: number) {
+    this.rand = seededRandom(seed);
+    this.temperatureC = baseTemp;
+    this.humidityPct = 45 + this.rand() * 10;
+    this.gasResistanceKohm = baseGasKohm;
+  }
+
+  tick(): TelemetrySample {
+    this.msgId += 1;
+    this.temperatureC += (this.rand() - 0.5) * 0.3;
+    this.humidityPct = clamp(this.humidityPct + (this.rand() - 0.5) * 1.2, 30, 80);
+    this.pressureHpa += (this.rand() - 0.5) * 0.4;
+    // 가스 저항은 VOC 농도가 오를수록 떨어지는 경향을 단순 시뮬레이션
+    this.gasResistanceKohm = clamp(this.gasResistanceKohm + (this.rand() - 0.52) * 4, 20, 180);
+    this.batteryV = clamp(this.batteryV - 0.00004 + (this.rand() - 0.5) * 0.0005, 3.3, 4.2);
+    this.uptimeS += 2;
+
+    const gasResistanceKohm = round(this.gasResistanceKohm, 1);
+    return {
+      msgId: this.msgId,
+      nodeId: "",
+      timestamp: isoNow(),
+      temperatureC: round(this.temperatureC, 2),
+      humidityPct: round(this.humidityPct, 1),
+      gasResistanceKohm,
+      gasValid: computeGasValid(gasResistanceKohm, this.rand),
+      qos: 1,
+      // ── 백엔드 미지원 필드 — mock 에서만 채웁니다 ──
+      pressureHpa: round(this.pressureHpa, 1),
+      rssiDbm: Math.round(-58 - this.rand() * 22),
+      batteryV: round(this.batteryV, 3),
+      uptimeS: this.uptimeS,
+    };
+  }
+}
+
 /** BME680 가스 저항이 정상 판정 범위를 벗어나는 경우가 드물게 섞이도록 시뮬레이션 */
-function computeGasValid(gasResistanceOhm: number, rand: () => number): boolean {
-  if (gasResistanceOhm < 25_000 || gasResistanceOhm > 175_000) return false;
+function computeGasValid(gasResistanceKohm: number, rand: () => number): boolean {
+  if (gasResistanceKohm < GAS_MIN_KOHM || gasResistanceKohm > GAS_MAX_KOHM) return false;
   return rand() > 0.03;
 }
 
@@ -123,53 +140,65 @@ function computeDeviceState(nodeId: string, tick: number): "active" | "asleep" |
   return tick % 5 === 0 ? "active" : "asleep";
 }
 
+/** 펌웨어가 실제로 보내는 JSON 키 이름을 그대로 흉내 냅니다. */
 function buildRawPayload(sample: TelemetrySample): string {
   const firmware = FIRMWARE_BY_NODE[sample.nodeId];
   const payload: Record<string, unknown> = {
-    msg_id: sample.msgId,
-    node_id: sample.nodeId,
-    ts: sample.timestamp,
-    temp_c: sample.temperatureC,
-    humidity_pct: sample.humidityPct,
-    pressure_hpa: sample.pressureHpa,
-    gas_ohm: sample.gasResistanceOhm,
-    gas_valid: sample.gasValid ?? true,
-    rssi_dbm: sample.rssiDbm,
-    battery_v: sample.batteryV,
+    temp: sample.temperatureC,
+    hum: sample.humidityPct,
+    gas: sample.gasResistanceKohm,
+    qos: sample.qos ?? 1,
+    rtt: 0.0,
+    retry: 0,
+    sleep_r: firmware === "gingerbread" ? 0.82 : 0.11,
   };
   if (firmware === "gingerbread") {
-    payload.device_state = (sample.deviceState ?? "asleep").toUpperCase();
+    payload.battery = 100;
+    payload.nn = 0.42;
+  } else {
+    payload.pkt = sample.msgId;
+    payload.bytes = sample.msgId * 96;
   }
   return JSON.stringify(payload, null, 2);
 }
 
-/** 펌웨어별 1회 통신 에너지 프로필 (mJ). Gingerbread(UDP, duty-cycle)가 Standard MQTT(TCP+TLS+keepalive) 대비 크게 낮음. */
-const ENERGY_PROFILE_MJ: Record<"standard_mqtt" | "monitor" | "gingerbread", { base: number; jitter: number }> = {
-  gingerbread: { base: 11, jitter: 3 },
-  standard_mqtt: { base: 38, jitter: 8 },
-  monitor: { base: 24, jitter: 6 },
+/**
+ * 펌웨어별 1회 통신 에너지 프로필 (mWh).
+ * Gingerbread(UDP, duty-cycle)가 Standard MQTT(TCP+keepalive) 대비 크게 낮습니다.
+ * 1 mWh = 3600 mJ 이므로 예전 mJ 값을 3600 으로 나눈 스케일입니다.
+ */
+const ENERGY_PROFILE_MWH: Record<FirmwareVariant, { base: number; jitter: number }> = {
+  gingerbread: { base: 11 / 3600, jitter: 3 / 3600 },
+  standard_mqtt: { base: 38 / 3600, jitter: 8 / 3600 },
+  monitor: { base: 24 / 3600, jitter: 6 / 3600 },
+  unknown: { base: 20 / 3600, jitter: 5 / 3600 },
 };
 
 const simStates = new Map<string, NodeSimState>([
-  ["node-01", new NodeSimState(1, 23.4, 95_000)],
-  ["node-02", new NodeSimState(2, 21.8, 110_000)],
-  ["node-03", new NodeSimState(3, 24.9, 78_000)],
+  [CLIENT_ID_STANDARD_MQTT, new NodeSimState(1, 23.4, 95)],
+  [CLIENT_ID_GINGERBREAD, new NodeSimState(2, 21.8, 110)],
+  [CLIENT_ID_MONITOR, new NodeSimState(3, 24.9, 78)],
 ]);
+
+function seedFor(nodeId: string): number {
+  if (nodeId === CLIENT_ID_STANDARD_MQTT) return 11;
+  if (nodeId === CLIENT_ID_GINGERBREAD) return 22;
+  return 33;
+}
 
 function historyFor(nodeId: string, count: number): TelemetrySample[] {
   const sim = simStates.get(nodeId);
   if (!sim) return [];
   const out: TelemetrySample[] = [];
-  const seed = nodeId === "node-01" ? 11 : nodeId === "node-02" ? 22 : 33;
-  const rand = seededRandom(seed);
+  const rand = seededRandom(seedFor(nodeId));
   let temp = sim.temperatureC - count * 0.02;
-  let gas = sim.gasResistanceOhm - count * 30;
+  let gas = sim.gasResistanceKohm - count * 0.03;
   let hum = sim.humidityPct;
   for (let i = 0; i < count; i += 1) {
     temp += (rand() - 0.5) * 0.3;
     hum = clamp(hum + (rand() - 0.5) * 1.1, 30, 80);
-    gas = clamp(gas + (rand() - 0.5) * 3800 + 25, 20_000, 180_000);
-    const gasResistanceOhm = Math.round(gas);
+    gas = clamp(gas + (rand() - 0.5) * 3.8 + 0.025, 20, 180);
+    const gasResistanceKohm = round(gas, 1);
     const msgId = i + 1;
     const sample: TelemetrySample = {
       msgId,
@@ -177,13 +206,15 @@ function historyFor(nodeId: string, count: number): TelemetrySample[] {
       timestamp: isoNow(-(count - i) * 2000),
       temperatureC: round(temp, 2),
       humidityPct: round(hum, 1),
+      gasResistanceKohm,
+      gasValid: computeGasValid(gasResistanceKohm, rand),
+      qos: 1,
+      deviceState: computeDeviceState(nodeId, msgId),
+      // ── 백엔드 미지원 필드 — mock 에서만 채웁니다 ──
       pressureHpa: round(1013 + Math.sin(i / 20) * 2, 1),
-      gasResistanceOhm,
       rssiDbm: Math.round(-58 - rand() * 22),
       batteryV: round(4.1 - i * 0.0002, 3),
       uptimeS: i * 2,
-      gasValid: computeGasValid(gasResistanceOhm, rand),
-      deviceState: computeDeviceState(nodeId, msgId),
     };
     sample.rawPayload = buildRawPayload(sample);
     out.push(sample);
@@ -193,68 +224,46 @@ function historyFor(nodeId: string, count: number): TelemetrySample[] {
 
 const SESSIONS: SessionSummary[] = [
   {
-    sessionId: "sess-2026-09-03-a",
-    nodeId: "node-01",
+    nodeId: CLIENT_ID_STANDARD_MQTT,
+    status: "active",
+    addrIp: "10.61.35.21",
+    addrPort: 1883,
+    connectedAt: isoNow(-1000 * 60 * 42),
+    lastSeen: isoNow(-1000 * 2),
+    packetCount: 1260,
     protocol: "mqtt",
     qos: 1,
-    status: "running",
-    startedAt: isoNow(-1000 * 60 * 42),
-    endedAt: null,
-    sampleCount: 1260,
-    droppedCount: 3,
   },
   {
-    sessionId: "sess-2026-09-03-b",
-    nodeId: "node-02",
-    protocol: "mqtt",
-    qos: 0,
-    status: "running",
-    startedAt: isoNow(-1000 * 60 * 42),
-    endedAt: null,
-    sampleCount: 1258,
-    droppedCount: 11,
-    note: "baseline 노드 — 실장 위치 다름",
-  },
-  {
-    sessionId: "sess-2026-09-03-c",
-    nodeId: "node-03",
+    nodeId: CLIENT_ID_GINGERBREAD,
+    status: "asleep",
+    addrIp: "10.61.35.22",
+    addrPort: 5000,
+    connectedAt: isoNow(-1000 * 60 * 42),
+    lastSeen: isoNow(-1000 * 6),
+    packetCount: 1258,
     protocol: "udp",
     qos: 0,
-    status: "running",
-    startedAt: isoNow(-1000 * 60 * 18),
-    endedAt: null,
-    sampleCount: 540,
-    droppedCount: 0,
+    note: "제안 시스템 — duty-cycle 로 대부분 ASLEEP",
   },
   {
-    sessionId: "sess-2026-09-02-a",
-    nodeId: "node-01",
-    protocol: "mqtt",
-    qos: 1,
-    status: "completed",
-    startedAt: isoNow(-1000 * 60 * 60 * 26),
-    endedAt: isoNow(-1000 * 60 * 60 * 20),
-    sampleCount: 10_800,
-    droppedCount: 22,
-  },
-  {
-    sessionId: "sess-2026-09-01-a",
-    nodeId: "node-03",
+    nodeId: CLIENT_ID_MONITOR,
+    status: "timed_out",
+    addrIp: "10.61.35.23",
+    addrPort: 5001,
+    connectedAt: isoNow(-1000 * 60 * 60 * 26),
+    lastSeen: isoNow(-1000 * 60 * 60 * 20),
+    packetCount: 210,
     protocol: "udp",
     qos: 0,
-    status: "error",
-    startedAt: isoNow(-1000 * 60 * 60 * 50),
-    endedAt: isoNow(-1000 * 60 * 60 * 49),
-    sampleCount: 210,
-    droppedCount: 87,
-    note: "패킷 파서 오류로 조기 종료",
+    note: "게이트웨이가 5001 포트를 수신하지 않아 유실됨",
   },
 ];
 
 function powerHistoryFor(nodeId: string, count: number): PowerSample[] {
-  const rand = seededRandom(nodeId === "node-01" ? 111 : nodeId === "node-02" ? 222 : 333);
-  const firmware = FIRMWARE_BY_NODE[nodeId] ?? "monitor";
-  const energyProfile = ENERGY_PROFILE_MJ[firmware];
+  const rand = seededRandom(seedFor(nodeId) * 10);
+  const firmware = FIRMWARE_BY_NODE[nodeId] ?? "unknown";
+  const energyProfile = ENERGY_PROFILE_MWH[firmware];
   const out: PowerSample[] = [];
   let batteryPct = 88 - rand() * 10;
   // 초기 몇 개 샘플은 Wi-Fi 연결(스캔/핸드셰이크) 비용이 섞여 에너지가 튀는 구간을 시뮬레이션
@@ -265,16 +274,26 @@ function powerHistoryFor(nodeId: string, count: number): PowerSample[] {
     batteryPct = clamp(batteryPct - 0.01 - rand() * 0.01, 0, 100);
     const isConnectionSpike = i < spikeCount;
     const rawEnergy = energyProfile.base + (rand() - 0.5) * energyProfile.jitter * 2;
-    const energyMj = round(isConnectionSpike ? rawEnergy * (4 + rand() * 3) : Math.max(rawEnergy, energyProfile.base * 0.4), 1);
+    const energyMwh = isConnectionSpike
+      ? rawEnergy * (4 + rand() * 3)
+      : Math.max(rawEnergy, energyProfile.base * 0.4);
+    const rttMs = round(12 + rand() * 30, 2);
     out.push({
       timestamp: isoNow(-(count - i) * 4000),
       nodeId,
+      qos: firmware === "standard_mqtt" ? 1 : 0,
+      rttMs,
+      retryCount: rand() > 0.9 ? 1 : 0,
+      sleepModeRatio: firmware === "gingerbread" ? round(0.8 + rand() * 0.1, 3) : round(rand() * 0.2, 3),
+      energyMwh: round(energyMwh, 8),
+      packetCount: i + 1,
+      totalBytes: (i + 1) * 96,
+      // ── 백엔드 미지원 필드 — mock 에서만 채웁니다 ──
       msgId: i + 1,
       voltageV: round(voltage, 3),
       currentMa: round(current, 1),
       powerMw: round(voltage * current, 1),
       estimatedBatteryPct: round(batteryPct, 1),
-      energyMj,
       isConnectionSpike,
     });
   }
@@ -287,55 +306,21 @@ function csvEscape(value: string | number | boolean | undefined): string {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-const configs = new Map<string, NodeConfig>([
-  [
-    "node-01",
-    {
-      nodeId: "node-01",
-      reportIntervalS: 2,
-      gasBaselineOhm: 95_000,
-      tempWarnC: 30,
-      humidityWarnPct: 70,
-      mqttTopic: "nodes/node-01/telemetry",
-      qos: 1,
-    },
-  ],
-  [
-    "node-02",
-    {
-      nodeId: "node-02",
-      reportIntervalS: 5,
-      gasBaselineOhm: 110_000,
-      tempWarnC: 28,
-      humidityWarnPct: 65,
-      mqttTopic: "nodes/node-02/telemetry",
-      qos: 0,
-    },
-  ],
-  [
-    "node-03",
-    {
-      nodeId: "node-03",
-      reportIntervalS: 1,
-      gasBaselineOhm: 78_000,
-      tempWarnC: 32,
-      humidityWarnPct: 75,
-      mqttTopic: "nodes/node-03/telemetry",
-      qos: 0,
-    },
-  ],
-]);
-
-const controlLog = new Map<string, ControlCommand[]>([
-  ["node-01", []],
-  ["node-02", []],
-  ["node-03", []],
-]);
+/** 백엔드 config.json 초기값과 같은 값으로 시작합니다. */
+let gatewayConfig: GatewayConfig = {
+  rssiThreshold: -80,
+  packetLossLimit: 5,
+  gasThresholdKohm: 20,
+  tempThresholdCelsius: 45,
+  powerMode: "EXTERNAL_5V",
+  currentBatteryLevel: 100,
+};
 
 export function createMockSource(intervalMs: number): TelemetrySource {
   let connectionState: ConnectionState = "connecting";
   const connectionListeners = new Set<(s: ConnectionState) => void>();
   const subscribers = new Map<string, Set<(s: TelemetrySample) => void>>();
+  let downlinkMsgId = 0;
 
   function setConnectionState(next: ConnectionState) {
     connectionState = next;
@@ -388,8 +373,8 @@ export function createMockSource(intervalMs: number): TelemetrySource {
       return nodeId ? SESSIONS.filter((s) => s.nodeId === nodeId) : SESSIONS;
     },
 
-    async getSession(sessionId) {
-      return SESSIONS.find((s) => s.sessionId === sessionId) ?? null;
+    async getSession(nodeId) {
+      return SESSIONS.find((s) => s.nodeId === nodeId) ?? null;
     },
 
     async getPowerHistory(nodeId, limitSamples) {
@@ -397,8 +382,8 @@ export function createMockSource(intervalMs: number): TelemetrySource {
     },
 
     async truncateTelemetry(nodeId) {
-      // mock 환경에는 실제 로그 파일이 없어 부작용은 없지만, 백엔드 동작(헤더만 남기고
-      // 데이터 본문을 비움)과 동일한 지연·응답 형태를 재현합니다.
+      // mock 환경에는 실제 로그 파일이 없어 부작용은 없지만, 지연·응답 형태만 재현합니다.
+      // (http 모드에서는 백엔드에 엔드포인트가 없어 UnsupportedOperationError 가 납니다.)
       void nodeId;
       await new Promise((r) => setTimeout(r, 300));
       return { truncatedAt: isoNow() };
@@ -406,21 +391,24 @@ export function createMockSource(intervalMs: number): TelemetrySource {
 
     async exportTelemetryCsv(nodeId) {
       const history = historyFor(nodeId, 500);
+      // 백엔드 telemetry.csv 와 같은 헤더를 씁니다.
       const header =
-        "msg_id,timestamp,temperature_c,humidity_pct,pressure_hpa,gas_resistance_ohm,gas_valid,rssi_dbm,battery_v,uptime_s,device_state\n";
+        "timestamp,client_id,msg_id,qos,topic_id,addr_ip,addr_port,temp,hum,gas,gas_valid,power,raw_payload\n";
       const rows = history.map((s) =>
         [
-          s.msgId,
           s.timestamp,
+          s.nodeId,
+          s.msgId,
+          s.qos ?? 0,
+          1,
+          "10.61.35.22",
+          5000,
           s.temperatureC,
           s.humidityPct,
-          s.pressureHpa,
-          s.gasResistanceOhm,
-          s.gasValid,
-          s.rssiDbm,
-          s.batteryV,
-          s.uptimeS,
-          s.deviceState ?? "",
+          s.gasResistanceKohm,
+          s.gasValid ? "True" : "False",
+          "",
+          s.rawPayload ?? "",
         ]
           .map(csvEscape)
           .join(",")
@@ -434,69 +422,56 @@ export function createMockSource(intervalMs: number): TelemetrySource {
       const delivered = 1200 + Math.floor(rand() * 400);
       return {
         nodeId,
-        windowLabel: "최근 1시간",
-        delivered,
-        duplicate: Math.floor(rand() * 6),
-        outOfOrder: Math.floor(rand() * 4),
-        parseErrors: nodeId === "node-03" ? Math.floor(rand() * 3) : 0,
-        avgLatencyMs: Math.round(40 + rand() * 90),
-        lastQos: (configs.get(nodeId)?.qos ?? 0) as 0 | 1 | 2,
+        windowLabel: "게이트웨이 전역 누적",
+        totalDelivered: delivered,
+        pendingQos2Count: Math.floor(rand() * 3),
+        totalPubackSent: Math.floor(delivered * 0.6),
+        totalPubrecSent: Math.floor(delivered * 0.2),
+        totalPubcompSent: Math.floor(delivered * 0.2),
+        totalQos2Expired: Math.floor(rand() * 4),
+        recvCount: delivered + Math.floor(rand() * 40),
+        errorCount: Math.floor(rand() * 3),
+        listenerAlive: true,
       } satisfies ProtocolStats;
     },
 
     async getStatsSummary(nodeId) {
       const history = historyFor(nodeId, 200);
-      const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+      const avg = (arr: number[]) =>
+        arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length;
       return {
         nodeId,
         windowKind: "time",
         windowLabel: "최근 200개 샘플",
         avgTemperatureC: round(avg(history.map((h) => h.temperatureC)), 2),
         avgHumidityPct: round(avg(history.map((h) => h.humidityPct)), 1),
-        avgGasResistanceOhm: Math.round(avg(history.map((h) => h.gasResistanceOhm))),
+        avgGasResistanceKohm: round(avg(history.map((h) => h.gasResistanceKohm)), 1),
         sampleCount: history.length,
       } satisfies StatsSummary;
     },
 
-    async getNodeConfig(nodeId) {
-      const cfg = configs.get(nodeId);
-      if (!cfg) throw new Error(`설정을 찾을 수 없습니다: ${nodeId}`);
-      return cfg;
+    async getGatewayConfig() {
+      return gatewayConfig;
     },
 
-    async updateNodeConfig(nodeId, patch) {
-      const cfg = configs.get(nodeId);
-      if (!cfg) throw new Error(`설정을 찾을 수 없습니다: ${nodeId}`);
-      const next = { ...cfg, ...patch };
-      configs.set(nodeId, next);
+    async updateGatewayConfig(patch) {
+      gatewayConfig = { ...gatewayConfig, ...patch };
       await new Promise((r) => setTimeout(r, 250));
-      return next;
+      return gatewayConfig;
     },
 
-    async listControlCommands(nodeId) {
-      return controlLog.get(nodeId) ?? [];
-    },
-
-    async sendControlCommand(nodeId, kind, payload) {
-      const cmd: ControlCommand = {
-        commandId: `cmd-${Date.now()}`,
-        nodeId,
-        kind,
-        payload,
-        issuedAt: isoNow(),
-        ackStatus: "pending",
-        ackAt: null,
-      };
-      const log = controlLog.get(nodeId) ?? [];
-      log.unshift(cmd);
-      controlLog.set(nodeId, log);
-
-      setTimeout(() => {
-        cmd.ackStatus = kind === "reboot" && Math.random() < 0.08 ? "failed" : "acked";
-        cmd.ackAt = isoNow();
-      }, 900);
-
-      return cmd;
+    async sendControlDownlink(nodeId, downlink: ControlDownlink) {
+      const session = SESSIONS.find((s) => s.nodeId === nodeId);
+      await new Promise((r) => setTimeout(r, 250));
+      downlinkMsgId += 1;
+      return {
+        status: "ok",
+        msgId: downlinkMsgId,
+        packetSize: 136,
+        target: `${session?.addrIp ?? "10.61.35.22"}:${session?.addrPort ?? 5000}`,
+        message: `다운링크 제어 패킷이 전송되었습니다 (qos=${downlink.qosLevel}, sleep=${downlink.sleepIntervalMs}ms).`,
+        timestamp: isoNow(),
+      } satisfies ControlResult;
     },
 
     getConnectionState() {
