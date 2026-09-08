@@ -6,34 +6,38 @@ import { useTelemetrySource, useConnectionState } from "@/hooks/useTelemetrySour
 import { StatTile } from "@/components/ui/StatTile";
 import { DeviceStateBadge } from "@/components/ui/DeviceStateBadge";
 import { GasValidTag } from "@/components/ui/GasValidTag";
+import { UnsupportedValue } from "@/components/ui/UnsupportedValue";
 import { LineChart } from "@/components/charts/LineChart";
 import { EnergyBarCompare } from "@/components/dashboard/EnergyBarCompare";
 import { SpikeFilterToggle } from "@/components/dashboard/SpikeFilterToggle";
 import { PayloadViewer } from "@/components/dashboard/PayloadViewer";
 import { ExperimentControlPanel } from "@/components/dashboard/ExperimentControlPanel";
+import { getDataSourceMode } from "@/lib/dataSource";
+import { markConnectionSpikes } from "@/lib/spike";
 import {
   FIRMWARE_COLOR,
-  formatEnergyMj,
+  MJ_PER_MWH,
+  SESSION_STATUS_COLOR,
+  SESSION_STATUS_LABEL,
+  formatEnergyPerMessage,
   formatGasResistance,
   formatHumidity,
+  formatPressure,
   formatRelativeTime,
+  formatRssi,
   formatTemperature,
+  formatUptime,
+  formatVoltage,
 } from "@/lib/format";
-import type { NodeInfo, PowerSample, SessionSummary } from "@/lib/dataSource/types";
-
-const EXPERIMENT_STATUS_LABEL: Record<SessionSummary["status"], string> = {
-  running: "실험 진행 중",
-  completed: "실험 완료",
-  error: "실험 오류",
-  aborted: "실험 중단됨",
-};
-
-const EXPERIMENT_STATUS_COLOR: Record<SessionSummary["status"], string> = {
-  running: "var(--signal-green)",
-  completed: "var(--text-secondary)",
-  error: "var(--signal-red)",
-  aborted: "var(--signal-amber)",
-};
+import type {
+  DeviceState,
+  NodeInfo,
+  PowerSample,
+  SessionStatus,
+  SessionSummary,
+  TelemetrySample,
+} from "@/lib/dataSource/types";
+import { UnsupportedOperationError } from "@/lib/dataSource/types";
 
 const CONNECTION_LABEL: Record<string, string> = {
   connected: "연결됨",
@@ -42,29 +46,36 @@ const CONNECTION_LABEL: Record<string, string> = {
   error: "오류",
 };
 
-function deriveExperimentStatus(sessions: SessionSummary[]): SessionSummary["status"] | null {
+/** 두 보드 동시 적용용 전송 주기. 백엔드는 ms 단위 sleep_interval 을 받습니다. */
+const DOWNLINK_QOS = 1;
+
+/**
+ * 실험 상태는 세션 상태에서 유도합니다.
+ * 백엔드에는 running/completed 같은 실험 단위 개념이 없고 노드 생사만 있습니다
+ * (docs/CONTRACT-DIFF.md 2-3절).
+ */
+function deriveExperimentStatus(sessions: SessionSummary[]): SessionStatus | null {
   if (sessions.length === 0) return null;
-  const priority: SessionSummary["status"][] = ["error", "running", "aborted", "completed"];
-  for (const status of priority) {
-    if (sessions.some((s) => s.status === status)) return status;
-  }
-  return sessions[0].status;
+  if (sessions.some((s) => s.status === "active")) return "active";
+  if (sessions.some((s) => s.status === "asleep")) return "asleep";
+  // 알 수 없는 status 만 남았다면 "응답 없음"으로 단정하지 않습니다.
+  if (sessions.some((s) => s.status === "timed_out")) return "timed_out";
+  return "unknown";
 }
 
+/** 회당 에너지 요약. 백엔드 단위가 mWh 라 표시용 mJ 는 여기서 환산합니다. */
 function summarizeEnergy(samples: PowerSample[], excludeSpikes: boolean) {
   const filtered = excludeSpikes ? samples.filter((s) => !s.isConnectionSpike) : samples;
-  const withEnergy = filtered.filter(
-    (s): s is PowerSample & { energyMj: number } => s.energyMj !== undefined
-  );
-  if (withEnergy.length === 0) return { avgMj: null as number | null, totalMj: 0 };
-  const totalMj = withEnergy.reduce((sum, s) => sum + s.energyMj, 0);
-  return { avgMj: totalMj / withEnergy.length, totalMj };
+  if (filtered.length === 0) return { avgMwh: null as number | null, totalMwh: 0 };
+  const totalMwh = filtered.reduce((sum, s) => sum + s.energyMwh, 0);
+  return { avgMwh: totalMwh / filtered.length, totalMwh };
 }
 
 export function OverviewPage() {
   const { nodes, loading } = useNodes();
   const source = useTelemetrySource();
   const connectionState = useConnectionState();
+  const mode = getDataSourceMode();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [spikeFilter, setSpikeFilter] = useState(true);
   const [reportIntervalS, setReportIntervalS] = useState<number | null>(null);
@@ -72,29 +83,50 @@ export function OverviewPage() {
   const [truncating, setTruncating] = useState(false);
   const [exportingNodeId, setExportingNodeId] = useState<string | null>(null);
   const [selectedPayloadNode, setSelectedPayloadNode] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "info" | "error"; text: string } | null>(null);
 
   useEffect(() => {
-    source.listSessions().then(setSessions);
+    let cancelled = false;
+    source
+      .listSessions()
+      .then((list) => {
+        if (!cancelled) setSessions(list);
+      })
+      .catch(() => {
+        if (!cancelled) setSessions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [source]);
 
   const gingerbread = nodes.find((n) => n.firmware === "gingerbread") ?? null;
   const standardMqtt = nodes.find((n) => n.firmware === "standard_mqtt") ?? null;
+  /** client_id 역조회에 실패한 패킷 묶음. 실제 노드가 아니므로 비교에서 제외하고 경고만 띄웁니다. */
+  const unidentified = nodes.filter((n) => n.isUnidentified);
 
   const gbTelemetry = useLiveTelemetry(gingerbread?.nodeId ?? null, 40);
   const mqttTelemetry = useLiveTelemetry(standardMqtt?.nodeId ?? null, 40);
 
-  const gbPower = usePowerHistory(gingerbread?.nodeId ?? null, 60, 3000);
-  const mqttPower = usePowerHistory(standardMqtt?.nodeId ?? null, 60, 3000);
+  const gbPowerRaw = usePowerHistory(gingerbread?.nodeId ?? null, 60, 3000);
+  const mqttPowerRaw = usePowerHistory(standardMqtt?.nodeId ?? null, 60, 3000);
 
-  const gbEnergy = useMemo(() => summarizeEnergy(gbPower.samples, spikeFilter), [gbPower.samples, spikeFilter]);
+  // 백엔드에 스파이크 플래그가 없어 프런트에서 판정해 채웁니다.
+  const gbSamples = useMemo(() => markConnectionSpikes(gbPowerRaw.samples), [gbPowerRaw.samples]);
+  const mqttSamples = useMemo(
+    () => markConnectionSpikes(mqttPowerRaw.samples),
+    [mqttPowerRaw.samples]
+  );
+
+  const gbEnergy = useMemo(() => summarizeEnergy(gbSamples, spikeFilter), [gbSamples, spikeFilter]);
   const mqttEnergy = useMemo(
-    () => summarizeEnergy(mqttPower.samples, spikeFilter),
-    [mqttPower.samples, spikeFilter]
+    () => summarizeEnergy(mqttSamples, spikeFilter),
+    [mqttSamples, spikeFilter]
   );
 
   const savingsPct =
-    gbEnergy.avgMj !== null && mqttEnergy.avgMj !== null && mqttEnergy.avgMj > 0
-      ? ((mqttEnergy.avgMj - gbEnergy.avgMj) / mqttEnergy.avgMj) * 100
+    gbEnergy.avgMwh !== null && mqttEnergy.avgMwh !== null && mqttEnergy.avgMwh > 0
+      ? ((mqttEnergy.avgMwh - gbEnergy.avgMwh) / mqttEnergy.avgMwh) * 100
       : null;
 
   const relevantSessions = sessions.filter(
@@ -102,8 +134,8 @@ export function OverviewPage() {
   );
   const experimentStatus = deriveExperimentStatus(relevantSessions);
 
-  const gbFiltered = spikeFilter ? gbPower.samples.filter((s) => !s.isConnectionSpike) : gbPower.samples;
-  const mqttFiltered = spikeFilter ? mqttPower.samples.filter((s) => !s.isConnectionSpike) : mqttPower.samples;
+  const gbFiltered = spikeFilter ? gbSamples.filter((s) => !s.isConnectionSpike) : gbSamples;
+  const mqttFiltered = spikeFilter ? mqttSamples.filter((s) => !s.isConnectionSpike) : mqttSamples;
 
   const payloadOptions = [
     gingerbread && {
@@ -118,19 +150,40 @@ export function OverviewPage() {
       color: FIRMWARE_COLOR.standard_mqtt,
       payload: mqttTelemetry.latest?.rawPayload ?? null,
     },
-  ].filter((o): o is { nodeId: string; label: string; color: string; payload: string | null } => Boolean(o));
+  ].filter((o): o is { nodeId: string; label: string; color: string; payload: string | null } =>
+    Boolean(o)
+  );
 
   const activePayloadNodeId = selectedPayloadNode ?? payloadOptions[0]?.nodeId ?? null;
 
+  /**
+   * 전송 주기 변경. 백엔드의 다운링크는 `{qos_level, sleep_interval(ms)}` 만 표현할 수 있어
+   * "보고 주기"를 슬립 간격으로 매핑합니다 (docs/CONTRACT-DIFF.md 1절).
+   */
   async function handleSetInterval(seconds: number) {
     const targets = [gingerbread, standardMqtt].filter((n): n is NodeInfo => n !== null);
     if (targets.length === 0) return;
     setApplyingInterval(true);
+    setNotice(null);
     try {
       await Promise.all(
-        targets.map((n) => source.sendControlCommand(n.nodeId, "set_report_interval", { seconds }))
+        targets.map((n) =>
+          source.sendControlDownlink(n.nodeId, {
+            qosLevel: DOWNLINK_QOS,
+            sleepIntervalMs: seconds * 1000,
+          })
+        )
       );
       setReportIntervalS(seconds);
+      setNotice({ kind: "info", text: `전송 주기를 ${seconds}초로 적용했습니다.` });
+    } catch (err) {
+      setNotice({
+        kind: "error",
+        text:
+          err instanceof UnsupportedOperationError
+            ? err.message
+            : `전송 주기 적용에 실패했습니다: ${(err as Error).message}`,
+      });
     } finally {
       setApplyingInterval(false);
     }
@@ -141,8 +194,18 @@ export function OverviewPage() {
     if (targets.length === 0) return;
     if (!window.confirm("로그를 초기화할까요? 헤더만 남고 데이터 본문이 모두 삭제됩니다.")) return;
     setTruncating(true);
+    setNotice(null);
     try {
       await Promise.all(targets.map((n) => source.truncateTelemetry(n.nodeId)));
+      setNotice({ kind: "info", text: "로그를 초기화했습니다." });
+    } catch (err) {
+      setNotice({
+        kind: "error",
+        text:
+          err instanceof UnsupportedOperationError
+            ? err.message
+            : `로그 초기화에 실패했습니다: ${(err as Error).message}`,
+      });
     } finally {
       setTruncating(false);
     }
@@ -150,16 +213,19 @@ export function OverviewPage() {
 
   async function handleExportCsv(nodeId: string) {
     setExportingNodeId(nodeId);
+    setNotice(null);
     try {
       const blob = await source.exportTelemetryCsv(nodeId);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${nodeId}-telemetry.csv`;
+      a.download = mode === "http" ? "telemetry.csv" : `${nodeId}-telemetry.csv`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+    } catch (err) {
+      setNotice({ kind: "error", text: `CSV 내보내기에 실패했습니다: ${(err as Error).message}` });
     } finally {
       setExportingNodeId(null);
     }
@@ -177,6 +243,9 @@ export function OverviewPage() {
     );
   }
 
+  const gbSession = sessions.find((s) => s.nodeId === gingerbread.nodeId);
+  const mqttSession = sessions.find((s) => s.nodeId === standardMqtt.nodeId);
+
   return (
     <div>
       <div className="page-header">
@@ -188,24 +257,33 @@ export function OverviewPage() {
         </div>
       </div>
 
+      {unidentified.length > 0 && (
+        <NoticeBar
+          kind="error"
+          text={`식별되지 않은 노드(client_id="unknown") 가 감지되었습니다. 게이트웨이가 CONNECT 를 놓쳤거나 UDP 소스 포트가 바뀌어 세션 역조회에 실패한 패킷으로, 어느 보드의 것인지 알 수 없어 비교에서 제외했습니다.`}
+        />
+      )}
+
+      {notice && <NoticeBar kind={notice.kind} text={notice.text} />}
+
       {/* KPI: 실험 상태 → 에너지 절감 순으로 시선이 이동하도록 상태 타일을 가장 먼저 배치 */}
       <div className="grid-stats">
         <StatTile
           label="실험 / 연결 상태"
-          value={experimentStatus ? EXPERIMENT_STATUS_LABEL[experimentStatus] : "대기 중"}
-          accent={experimentStatus ? EXPERIMENT_STATUS_COLOR[experimentStatus] : undefined}
+          value={experimentStatus ? SESSION_STATUS_LABEL[experimentStatus] : "대기 중"}
+          accent={experimentStatus ? SESSION_STATUS_COLOR[experimentStatus] : undefined}
           sub={`연결 ${CONNECTION_LABEL[connectionState] ?? connectionState}`}
         />
         <StatTile
           label="Gingerbread 1회 통신 에너지"
-          value={gbEnergy.avgMj !== null ? gbEnergy.avgMj.toFixed(1) : "-"}
+          value={gbEnergy.avgMwh !== null ? (gbEnergy.avgMwh * MJ_PER_MWH).toFixed(1) : "-"}
           unit="mJ"
           accent="var(--signal-violet)"
           sub={gingerbread.name}
         />
         <StatTile
           label="Standard MQTT 1회 통신 에너지"
-          value={mqttEnergy.avgMj !== null ? mqttEnergy.avgMj.toFixed(1) : "-"}
+          value={mqttEnergy.avgMwh !== null ? (mqttEnergy.avgMwh * MJ_PER_MWH).toFixed(1) : "-"}
           unit="mJ"
           accent="var(--signal-teal)"
           sub={standardMqtt.name}
@@ -231,16 +309,23 @@ export function OverviewPage() {
               {
                 label: `${standardMqtt.name} (mJ)`,
                 color: FIRMWARE_COLOR.standard_mqtt,
-                values: mqttFiltered.map((s) => s.energyMj ?? 0),
+                values: mqttFiltered.map((s) => s.energyMwh),
               },
               {
                 label: `${gingerbread.name} (mJ)`,
                 color: FIRMWARE_COLOR.gingerbread,
-                values: gbFiltered.map((s) => s.energyMj ?? 0),
+                values: gbFiltered.map((s) => s.energyMwh),
               },
             ]}
-            formatValue={formatEnergyMj}
+            formatValue={formatEnergyPerMessage}
           />
+          {mode === "http" && (
+            <p className="page-sub" style={{ marginTop: 10, fontSize: 11 }}>
+              Gingerbread 펌웨어는 페이로드의 <code>rtt</code> 를 항상 0 으로 보내고, 게이트웨이의
+              에너지 추정식이 RTT 기반이라 이 값이 0 에 가깝게 나올 수 있습니다
+              (docs/CONTRACT-DIFF.md 6절).
+            </p>
+          )}
         </div>
       </div>
 
@@ -251,8 +336,16 @@ export function OverviewPage() {
         <div className="panel-body">
           <EnergyBarCompare
             bars={[
-              { label: gingerbread.name, color: FIRMWARE_COLOR.gingerbread, valueMj: gbEnergy.totalMj },
-              { label: standardMqtt.name, color: FIRMWARE_COLOR.standard_mqtt, valueMj: mqttEnergy.totalMj },
+              {
+                label: gingerbread.name,
+                color: FIRMWARE_COLOR.gingerbread,
+                valueMwh: gbEnergy.totalMwh,
+              },
+              {
+                label: standardMqtt.name,
+                color: FIRMWARE_COLOR.standard_mqtt,
+                valueMwh: mqttEnergy.totalMwh,
+              },
             ]}
           />
         </div>
@@ -269,22 +362,14 @@ export function OverviewPage() {
               <BoardStatusRow
                 name={gingerbread.name}
                 color={FIRMWARE_COLOR.gingerbread}
-                deviceState={gbTelemetry.latest?.deviceState}
-                gasValid={gbTelemetry.latest?.gasValid}
-                temperatureC={gbTelemetry.latest?.temperatureC}
-                humidityPct={gbTelemetry.latest?.humidityPct}
-                gasResistanceOhm={gbTelemetry.latest?.gasResistanceOhm}
-                updatedAt={gbTelemetry.latest?.timestamp}
+                sample={gbTelemetry.latest}
+                sessionStatus={gbSession?.status}
               />
               <BoardStatusRow
                 name={standardMqtt.name}
                 color={FIRMWARE_COLOR.standard_mqtt}
-                deviceState={mqttTelemetry.latest?.deviceState}
-                gasValid={mqttTelemetry.latest?.gasValid}
-                temperatureC={mqttTelemetry.latest?.temperatureC}
-                humidityPct={mqttTelemetry.latest?.humidityPct}
-                gasResistanceOhm={mqttTelemetry.latest?.gasResistanceOhm}
-                updatedAt={mqttTelemetry.latest?.timestamp}
+                sample={mqttTelemetry.latest}
+                sessionStatus={mqttSession?.status}
               />
             </div>
             <LineChart
@@ -292,15 +377,15 @@ export function OverviewPage() {
                 {
                   label: `${standardMqtt.name} 가스저항 (kΩ)`,
                   color: FIRMWARE_COLOR.standard_mqtt,
-                  values: mqttTelemetry.samples.map((s) => s.gasResistanceOhm / 1000),
+                  values: mqttTelemetry.samples.map((s) => s.gasResistanceKohm),
                 },
                 {
                   label: `${gingerbread.name} 가스저항 (kΩ)`,
                   color: FIRMWARE_COLOR.gingerbread,
-                  values: gbTelemetry.samples.map((s) => s.gasResistanceOhm / 1000),
+                  values: gbTelemetry.samples.map((s) => s.gasResistanceKohm),
                 },
               ]}
-              formatValue={(v) => `${v.toFixed(1)} kΩ`}
+              formatValue={formatGasResistance}
               height={140}
             />
           </div>
@@ -332,14 +417,27 @@ export function OverviewPage() {
             onSetInterval={handleSetInterval}
             onTruncate={handleTruncate}
             truncating={truncating}
+            truncateUnsupported={mode === "http"}
             onExportCsv={handleExportCsv}
             exportingNodeId={exportingNodeId}
-            statusLabel={experimentStatus ? EXPERIMENT_STATUS_LABEL[experimentStatus] : "대기 중"}
-            statusColor={experimentStatus ? EXPERIMENT_STATUS_COLOR[experimentStatus] : "var(--text-tertiary)"}
-            exportTargets={[
-              { nodeId: gingerbread.nodeId, label: gingerbread.name },
-              { nodeId: standardMqtt.nodeId, label: standardMqtt.name },
-            ]}
+            statusLabel={experimentStatus ? SESSION_STATUS_LABEL[experimentStatus] : "대기 중"}
+            statusColor={
+              experimentStatus ? SESSION_STATUS_COLOR[experimentStatus] : "var(--text-tertiary)"
+            }
+            exportTargets={
+              // http 모드의 백엔드는 CSV 를 통째로 내려주므로 노드별 버튼이 의미가 없습니다.
+              mode === "http"
+                ? [{ nodeId: gingerbread.nodeId, label: "전체 텔레메트리" }]
+                : [
+                    { nodeId: gingerbread.nodeId, label: gingerbread.name },
+                    { nodeId: standardMqtt.nodeId, label: standardMqtt.name },
+                  ]
+            }
+            exportNote={
+              mode === "http"
+                ? "게이트웨이는 telemetry.csv 를 통째로 내려줍니다 — 노드별로 분리되지 않습니다."
+                : null
+            }
           />
         </div>
       </div>
@@ -347,25 +445,43 @@ export function OverviewPage() {
   );
 }
 
+function NoticeBar({ kind, text }: { kind: "info" | "error"; text: string }) {
+  const color = kind === "error" ? "var(--signal-red)" : "var(--signal-teal)";
+  return (
+    <div
+      style={{
+        marginBottom: 14,
+        padding: "10px 12px",
+        borderRadius: "var(--radius-sm)",
+        background: "var(--bg-inset)",
+        border: `1px solid ${color}`,
+        color: "var(--text-secondary)",
+        fontSize: 12,
+        lineHeight: 1.6,
+      }}
+    >
+      <span className="dot" style={{ background: color, marginRight: 8 }} />
+      {text}
+    </div>
+  );
+}
+
 function BoardStatusRow({
   name,
   color,
-  deviceState,
-  gasValid,
-  temperatureC,
-  humidityPct,
-  gasResistanceOhm,
-  updatedAt,
+  sample,
+  sessionStatus,
 }: {
   name: string;
   color: string;
-  deviceState?: "active" | "asleep";
-  gasValid?: boolean;
-  temperatureC?: number;
-  humidityPct?: number;
-  gasResistanceOhm?: number;
-  updatedAt?: string;
+  sample: TelemetrySample | null;
+  sessionStatus?: SessionStatus;
 }) {
+  // 세션 상태가 있으면 그쪽을 우선합니다 — 텔레메트리에는 device_state 가 없습니다.
+  const deviceState: DeviceState | undefined =
+    sample?.deviceState ??
+    (sessionStatus === "active" ? "active" : sessionStatus === "asleep" ? "asleep" : undefined);
+
   return (
     <div
       style={{
@@ -385,33 +501,68 @@ function BoardStatusRow({
         <span style={{ fontSize: 13 }}>{name}</span>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-        {temperatureC !== undefined && (
-          <MiniValue label="온도" value={formatTemperature(temperatureC)} />
-        )}
-        {humidityPct !== undefined && <MiniValue label="습도" value={formatHumidity(humidityPct)} />}
-        {gasResistanceOhm !== undefined && (
-          <MiniValue label="가스" value={formatGasResistance(gasResistanceOhm)} />
-        )}
-        <DeviceStateBadge state={deviceState} />
-        <GasValidTag valid={gasValid} />
-        {updatedAt && (
+      {sample === null ? (
+        <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
+          아직 수신된 데이터가 없습니다.
+        </span>
+      ) : (
+        <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+          <MiniValue label="온도" value={formatTemperature(sample.temperatureC)} />
+          <MiniValue label="습도" value={formatHumidity(sample.humidityPct)} />
+          <MiniValue label="가스" value={formatGasResistance(sample.gasResistanceKohm)} />
+
+          {/* 아래 4개는 백엔드/펌웨어가 제공하지 않습니다 — mock 에서만 값이 보입니다. */}
+          <MiniValue
+            label="기압"
+            value={sample.pressureHpa !== undefined ? formatPressure(sample.pressureHpa) : null}
+            unsupportedReason="펌웨어 JSON 에 기압 필드가 없습니다"
+          />
+          <MiniValue
+            label="RSSI"
+            value={sample.rssiDbm !== undefined ? formatRssi(sample.rssiDbm) : null}
+            unsupportedReason="config.json 의 RSSI_THRESHOLD 는 임계값이지 측정값이 아닙니다"
+          />
+          <MiniValue
+            label="배터리"
+            value={sample.batteryV !== undefined ? formatVoltage(sample.batteryV) : null}
+            unsupportedReason="펌웨어가 보내는 battery(%) 를 게이트웨이가 파싱하지 않고 버립니다"
+          />
+          <MiniValue
+            label="가동시간"
+            value={sample.uptimeS !== undefined ? formatUptime(sample.uptimeS) : null}
+            unsupportedReason="게이트웨이가 uptime 을 기록하지 않습니다"
+          />
+
+          <DeviceStateBadge state={deviceState} />
+          <GasValidTag valid={sample.gasValid} />
           <span className="mono" style={{ fontSize: 11, color: "var(--text-tertiary)" }}>
-            {formatRelativeTime(updatedAt)}
+            {formatRelativeTime(sample.timestamp)}
           </span>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function MiniValue({ label, value }: { label: string; value: string }) {
+function MiniValue({
+  label,
+  value,
+  unsupportedReason,
+}: {
+  label: string;
+  value: string | null;
+  unsupportedReason?: string;
+}) {
   return (
     <div>
       <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>{label}</div>
-      <div className="mono" style={{ fontSize: 13 }}>
-        {value}
-      </div>
+      {value === null ? (
+        <UnsupportedValue reason={unsupportedReason} />
+      ) : (
+        <div className="mono" style={{ fontSize: 13 }}>
+          {value}
+        </div>
+      )}
     </div>
   );
 }

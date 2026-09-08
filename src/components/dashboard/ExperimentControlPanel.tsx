@@ -11,22 +11,28 @@ export function ExperimentControlPanel({
   onSetInterval,
   onTruncate,
   truncating,
+  truncateUnsupported = false,
   onExportCsv,
   exportingNodeId,
   statusLabel,
   statusColor,
   exportTargets,
+  exportNote = null,
 }: {
   activeIntervalS: number | null;
   applyingInterval: boolean;
   onSetInterval: (seconds: number) => void;
   onTruncate: () => void;
   truncating: boolean;
+  /** 게이트웨이에 truncate 엔드포인트가 없는 경우 버튼을 잠급니다. */
+  truncateUnsupported?: boolean;
   onExportCsv: (nodeId: string) => void;
   exportingNodeId: string | null;
   statusLabel: string;
   statusColor: string;
   exportTargets: ExportTarget[];
+  /** CSV 내보내기 동작의 제약을 알리는 한 줄 안내. */
+  exportNote?: string | null;
 }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -59,8 +65,22 @@ export function ExperimentControlPanel({
       </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-        <button className="btn" disabled={truncating} onClick={onTruncate}>
+        <button
+          className="btn"
+          disabled={truncating || truncateUnsupported}
+          onClick={onTruncate}
+          title={
+            truncateUnsupported
+              ? "게이트웨이에 로그 초기화 엔드포인트가 없습니다 (docs/CONTRACT-DIFF.md 1절)"
+              : undefined
+          }
+        >
           {truncating ? "초기화 중…" : "로그 초기화 (Truncate)"}
+          {truncateUnsupported && (
+            <span style={{ fontSize: 10, marginLeft: 6, color: "var(--text-tertiary)" }}>
+              백엔드 미지원
+            </span>
+          )}
         </button>
 
         {exportTargets.map((t) => (
@@ -79,6 +99,10 @@ export function ExperimentControlPanel({
           {statusLabel}
         </span>
       </div>
+
+      {exportNote && (
+        <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: -8 }}>{exportNote}</div>
+      )}
     </div>
   );
 }
